@@ -15,7 +15,6 @@ import android.os.PowerManager
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
-import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.ImageView
 import androidx.core.app.NotificationCompat
@@ -24,38 +23,31 @@ import kotlin.math.abs
 class FloatingOverlayService : Service() {
 
     companion object {
-        const val NOTIF_ID       = 1001
-        const val CHANNEL_ID     = "guard_ch"
-        const val ACTION_STOP    = "com.shohan.geminiguard.STOP"
-        const val ACTION_TOGGLE  = "com.shohan.geminiguard.TOGGLE"
+        const val NOTIF_ID      = 1001
+        const val CHANNEL_ID    = "guard_ch"
+        const val ACTION_STOP   = "com.shohan.geminiguard.STOP"
+        const val ACTION_TOGGLE = "com.shohan.geminiguard.TOGGLE"
 
         @Volatile var isRunning     = false
         @Volatile var isGuardActive = false
     }
 
     private lateinit var wm: WindowManager
-
     private var floatingView: ImageView? = null
     private var blackView: View?         = null
     private var wakeLock: PowerManager.WakeLock? = null
-
-    // Button layout params — stored as field so position is remembered across activate/deactivate
     private lateinit var btnLp: WindowManager.LayoutParams
 
-    // Touch tracking
     private var startX = 0;  private var startY = 0
     private var touchX = 0f; private var touchY = 0f
     private var dragging = false
-
-    // ──────────────────────────────────────────────────────────────────────────
-    // Lifecycle
-    // ──────────────────────────────────────────────────────────────────────────
+    private var lastTapTime = 0L
 
     override fun onCreate() {
         super.onCreate()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         btnLp = WindowManager.LayoutParams(
-            dp(58), dp(58),
+            dp(62), dp(62),
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
@@ -77,10 +69,12 @@ class FloatingOverlayService : Service() {
                 return START_STICKY
             }
         }
-        // Normal start
-        startForeground(NOTIF_ID, buildNotif())
-        addButton()
-        isRunning = true
+        // একবারই button add হবে — multiple icon সমস্যা ঠিক
+        if (!isRunning) {
+            startForeground(NOTIF_ID, buildNotif())
+            addButton()
+            isRunning = true
+        }
         return START_STICKY
     }
 
@@ -93,17 +87,13 @@ class FloatingOverlayService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Floating button
-    // ──────────────────────────────────────────────────────────────────────────
-
     private fun addButton() {
         val iv = ImageView(this).apply {
             setImageResource(R.drawable.ic_shield)
             imageTintList = ColorStateList.valueOf(Color.WHITE)
             setPadding(dp(13), dp(13), dp(13), dp(13))
             background = circleBg(Color.parseColor("#6C63FF"))
-            elevation  = dp(6).toFloat()
+            elevation  = dp(8).toFloat()
         }
         iv.setOnTouchListener { v, ev -> handleTouch(v, ev) }
         floatingView = iv
@@ -120,7 +110,7 @@ class FloatingOverlayService : Service() {
             MotionEvent.ACTION_MOVE -> {
                 val dx = (ev.rawX - touchX).toInt()
                 val dy = (ev.rawY - touchY).toInt()
-                if (!dragging && (abs(dx) > 8 || abs(dy) > 8)) dragging = true
+                if (!dragging && (abs(dx) > 10 || abs(dy) > 10)) dragging = true
                 if (dragging) {
                     btnLp.x = startX + dx
                     btnLp.y = startY + dy
@@ -131,7 +121,18 @@ class FloatingOverlayService : Service() {
             }
             MotionEvent.ACTION_UP -> {
                 if (!dragging) {
-                    if (isGuardActive) deactivate() else activate()
+                    if (!isGuardActive) {
+                        activate()
+                    } else {
+                        // Double-tap লাগবে deactivate করতে
+                        val now = System.currentTimeMillis()
+                        if (now - lastTapTime < 500L) {
+                            deactivate()
+                            lastTapTime = 0L
+                        } else {
+                            lastTapTime = now
+                        }
+                    }
                 }
                 true
             }
@@ -139,80 +140,64 @@ class FloatingOverlayService : Service() {
         }
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Guard ON
-    // ──────────────────────────────────────────────────────────────────────────
-
     private fun activate() {
         isGuardActive = true
 
-        // Keep CPU running while screen appears off
         val pm = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "GeminiGuard:WakeLock"
-        )
-        wakeLock?.acquire(2 * 60 * 60 * 1000L)   // 2 hours max
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "GeminiGuard:WakeLock")
+        wakeLock?.acquire(2 * 60 * 60 * 1000L)
 
-        // Remove button temporarily so overlay goes below it
         floatingView?.let { if (it.isAttachedToWindow) wm.removeView(it) }
 
-        // Full-screen opaque black overlay — FLAG_KEEP_SCREEN_ON keeps screen
-        // technically ON so Gemini's TTS continues; visually the screen looks OFF
-        val bv = View(this).apply { setBackgroundColor(Color.BLACK) }
-        blackView = bv
-        wm.addView(
-            bv,
-            WindowManager.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                PixelFormat.OPAQUE
-            )
-        )
+        // সম্পূর্ণ স্ক্রিন কালো — status bar এবং nav bar সহ
+        val statusBarH = getStatusBarHeight()
+        val navBarH    = getNavBarHeight()
+        val dm         = resources.displayMetrics
 
-        // Re-add button on top of overlay with red tint (stop indicator)
-        floatingView?.apply {
-            background = circleBg(Color.parseColor("#E53935"))
+        val bv = View(this).apply {
+            setBackgroundColor(Color.BLACK)
+            // সব touch consume করবে — কিছুই pass through হবে না
+            setOnTouchListener { _, _ -> true }
         }
+        blackView = bv
+
+        wm.addView(bv, WindowManager.LayoutParams(
+            dm.widthPixels,
+            dm.heightPixels + statusBarH + navBarH + dp(20),
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.OPAQUE
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = -statusBarH
+        })
+
+        // Button overlay-র উপরে — লাল রং
+        floatingView?.background = circleBg(Color.parseColor("#E53935"))
         floatingView?.let { wm.addView(it, btnLp) }
 
         updateNotif()
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Guard OFF
-    // ──────────────────────────────────────────────────────────────────────────
-
     private fun deactivate() {
         isGuardActive = false
+        lastTapTime = 0L
+        wakeLock?.release(); wakeLock = null
 
-        wakeLock?.release()
-        wakeLock = null
-
-        // Remove black overlay — screen visible again
         blackView?.let { if (it.isAttachedToWindow) wm.removeView(it) }
         blackView = null
 
-        // Restore button to purple
         floatingView?.background = circleBg(Color.parseColor("#6C63FF"))
-
         updateNotif()
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Notification
-    // ──────────────────────────────────────────────────────────────────────────
-
     private fun createChannel() {
-        val ch = NotificationChannel(
-            CHANNEL_ID,
-            "GeminiGuard",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply { setShowBadge(false) }
+        val ch = NotificationChannel(CHANNEL_ID, "GeminiGuard", NotificationManager.IMPORTANCE_LOW)
+        ch.setShowBadge(false)
         nm().createNotificationChannel(ch)
     }
 
@@ -231,29 +216,18 @@ class FloatingOverlayService : Service() {
             .setSmallIcon(R.drawable.ic_shield)
             .setContentTitle(if (isGuardActive) "গার্ড সক্রিয়" else "GeminiGuard প্রস্তুত")
             .setContentText(
-                if (isGuardActive)
-                    "স্ক্রিন কালো · Gemini Audio চলছে"
-                else
-                    "শিল্ড বাটনে ট্যাপ করুন"
+                if (isGuardActive) "স্ক্রিন কালো · লাল বাটনে Double-tap করুন"
+                else "শিল্ড বাটনে ট্যাপ করুন"
             )
             .setOngoing(true)
             .setSilent(true)
-            .addAction(
-                R.drawable.ic_shield,
-                if (isGuardActive) "বন্ধ করুন" else "গার্ড চালু",
-                togglePi
-            )
+            .addAction(R.drawable.ic_shield,
+                if (isGuardActive) "বন্ধ করুন" else "গার্ড চালু", togglePi)
             .addAction(R.drawable.ic_shield, "সার্ভিস বন্ধ", stopPi)
             .build()
     }
 
-    private fun updateNotif() {
-        nm().notify(NOTIF_ID, buildNotif())
-    }
-
-    // ──────────────────────────────────────────────────────────────────────────
-    // Cleanup
-    // ──────────────────────────────────────────────────────────────────────────
+    private fun updateNotif() { nm().notify(NOTIF_ID, buildNotif()) }
 
     private fun cleanup() {
         wakeLock?.release(); wakeLock = null
@@ -261,18 +235,22 @@ class FloatingOverlayService : Service() {
         blackView?.let    { if (it.isAttachedToWindow) wm.removeView(it) }
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Helpers
-    // ──────────────────────────────────────────────────────────────────────────
+    private fun getStatusBarHeight(): Int {
+        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (id > 0) resources.getDimensionPixelSize(id) else dp(24)
+    }
 
-    private fun dp(value: Int) =
-        (value * resources.displayMetrics.density + 0.5f).toInt()
+    private fun getNavBarHeight(): Int {
+        val id = resources.getIdentifier("navigation_bar_height", "dimen", "android")
+        return if (id > 0) resources.getDimensionPixelSize(id) else dp(48)
+    }
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density + 0.5f).toInt()
 
     private fun circleBg(color: Int) = GradientDrawable().apply {
         shape = GradientDrawable.OVAL
         setColor(color)
     }
 
-    private fun nm() =
-        getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+    private fun nm() = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
 }
